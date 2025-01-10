@@ -222,6 +222,7 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 print(f"using device: {device}")
 
 train_loader = DataLoaderLite(B=4, T=32)
+torch.set_float32_matmul_precision('high')
 
 enc = toktoken.get_encoding("gpt2")
 with open('input.txt', 'r') as f:
