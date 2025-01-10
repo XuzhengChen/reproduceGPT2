@@ -272,6 +272,9 @@ for i in range(50):
     with torch.autocast(device_type=device, dtype=torch.float16):
         logits, loss = model(x, y)
     loss.backward()
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
