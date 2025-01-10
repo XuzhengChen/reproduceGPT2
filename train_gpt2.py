@@ -168,13 +168,6 @@ class GPT(nn.Module):
 
         return model
 
-num_return_sequences = 5
-max_length = 30
-# model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig)
-model.eval()
-model.to('cuda')
-
 # prefix
 import tiktoken
 
@@ -229,17 +222,14 @@ train_loader = DataLoaderLite(B=4, T=32)
 torch.set_float32_matmul_precision('high')
 
 enc = toktoken.get_encoding("gpt2")
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]  
-tokens = enc.encode(text) 
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T + 1])  
-x = buf[:-1].view(B, T)  
-y = buf[1:].view(B, T)   
+
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 model = torch.compile(model)
 
@@ -264,21 +254,24 @@ def get_lr(it):
 
 # logits, loss = model(x, y)
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-for i in range(50):
+for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.float16):
-        logits, loss = model(x, y)
-    loss.backward()
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.float16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss.backward()
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
-    tokens_per_sec = train_loader.B * train_loader.T / (t1 - t0)
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+    tokens_per_sec = tokens_processed / dt
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     print(f"step {i}, loss: {loss.item()}, norm : {norm}, dt: {(t1 - t0)*1000}ms, tokens/sec: {tokens_per_sec}")
 
