@@ -211,14 +211,51 @@ class DataLoaderLite:
             self.current_position = B * T * self.process_rank
         return x, y
 
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print(f"using device: {device}")
+# run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
-train_loader = DataLoaderLite(B=4, T=32)
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
+device_type = "cuda" if device.startswith("cuda") else "cpu"
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+enc = tiktoken.get_encoding("gpt2")
+
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+B = 64 # micro batch size
+T = 1024 # sequence length
+
+train_loader = DataLoaderLite(B=B, T=T)
 torch.set_float32_matmul_precision('high')
 
 enc = toktoken.get_encoding("gpt2")
@@ -232,7 +269,8 @@ if master_process:
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 model = torch.compile(model)
-
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -263,7 +301,12 @@ for step in range(max_steps):
         with torch.autocast(device_type=device, dtype=torch.float16):
             logits, loss = model(x, y)
         loss = loss / grad_accum_steps
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -272,33 +315,8 @@ for step in range(max_steps):
     t1 = time.time()
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    
     print(f"step {i}, loss: {loss.item()}, norm : {norm}, dt: {(t1 - t0)*1000}ms, tokens/sec: {tokens_per_sec}")
 
-print(logits.shape)
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to('cuda')
-while xgen.size(1) < max_length:
-    # forward the model to get the logits
-    with torch.no_grad():
-        logits = model(x)
-        # take the logits at the last position
-        logits = logits[:, -1, :] # (B, vocab_size)
-        # get the probabilities
-        probs = F.softmax(logits, dim=-1)
-        # do top-k sampling of 50 (huggingface pipeline default)
-        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # select a token from the top-k probabilities
-        # note: multinomial does not demand the input to sum to 1
-        ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
-        # gather the corresponding indices
-        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-        # append to the sequence
-        x = torch.cat((xgen, xcol), dim=1)
-
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+if ddp:
+    destroy_process_group()
