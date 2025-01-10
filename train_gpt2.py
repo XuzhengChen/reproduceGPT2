@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
+import time
 from torch.nn import functional as F
 
 class CausalSelfAttention(nn.Module):
@@ -93,7 +94,7 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            
+
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
         B, T = idx.size()
@@ -238,13 +239,18 @@ model.to(device)
 # logits, loss = model(x, y)
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    tokens_per_sec = train_loader.B * train_loader.T / (t1 - t0)
+
+    print(f"step {i}, loss: {loss.item()}, dt: {(t1 - t0)*1000}ms, tokens/sec: {tokens_per_sec}")
 
 print(logits.shape)
 tokens = torch.tensor(tokens, dtype=torch.long)
