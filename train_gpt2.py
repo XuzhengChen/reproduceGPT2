@@ -243,7 +243,7 @@ model = GPT(GPTConfig())
 model.to(device)
 model = torch.compile(model)
 # logits, loss = model(x, y)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 for i in range(50):
     t0 = time.time()
     x, y = train_loader.next_batch()
@@ -256,8 +256,8 @@ for i in range(50):
     torch.cuda.synchronize()
     t1 = time.time()
     tokens_per_sec = train_loader.B * train_loader.T / (t1 - t0)
-
-    print(f"step {i}, loss: {loss.item()}, dt: {(t1 - t0)*1000}ms, tokens/sec: {tokens_per_sec}")
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    print(f"step {i}, loss: {loss.item()}, norm : {norm}, dt: {(t1 - t0)*1000}ms, tokens/sec: {tokens_per_sec}")
 
 print(logits.shape)
 tokens = torch.tensor(tokens, dtype=torch.long)
